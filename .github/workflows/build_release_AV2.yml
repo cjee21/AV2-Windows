@@ -1,0 +1,146 @@
+name: Build and release AVM
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: 'Tag/branch/SHA to build and release (e.g. v1.0.0)'
+        required: true
+        default: v1.0.0
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-latest
+          #- name: windows-arm64 # ARM64 fails to build on MSVC
+          #  runner: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          path: AV2-Windows
+
+      - name: Checkout AOMedia AVM
+        uses: actions/checkout@v6
+        with:
+          repository: AOMediaCodec/avm
+          ref: ${{ inputs.ref }}
+          path: avm
+
+      - name: Setup MSVC Environment
+        uses: ./AV2-Windows/.github/actions/setup-msvc
+
+      - name: Patch CMake Install
+        run: |
+          cd avm
+          (Get-Content -Path "cmake\avm_install.cmake" -Raw) -replace 
+              'if\(NOT \(MSVC OR XCODE\)\)', 
+              'if(NOT (CMAKE_GENERATOR MATCHES "Visual Studio" OR XCODE))' | 
+              Set-Content -Path "cmake\avm_install.cmake" -Encoding utf8
+
+      - name: Configure
+        run: cmake avm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=avm-install -DENABLE_TESTS=0 -DENABLE_TOOLS=0
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Install
+        run: cmake --install build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: avm-${{ matrix.name }}
+          path: avm-install\*
+
+  create_release:
+    name: Package and Release
+    needs: [build]
+    runs-on: windows-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Download all architecture artifacts
+        uses: actions/download-artifact@v8
+        with:
+          path: .\downloaded-artifacts
+
+      - name: Package each artifact
+        shell: powershell
+        env:
+          # Pass GitHub metadata into the script
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RUN_ID: ${{ github.run_id }}
+          REPO: ${{ github.repository }}
+        run: |
+          New-Item -ItemType Directory -Force -Path .\release-zips
+          
+          # 1. Query the GitHub API for the actual artifact names in this run
+          $url = "https://api.github.com/repos/$env:REPO/actions/runs/$env:RUN_ID/artifacts"
+          $headers = @{
+              "Authorization" = "Bearer $env:GH_TOKEN"
+              "Accept"        = "application/vnd.github+json"
+          }
+          
+          Write-Host "Fetching artifact metadata from GitHub API..."
+          $apiResponse = Invoke-RestMethod -Uri $url -Headers $headers -Method Get
+          $artifacts = $apiResponse.artifacts
+          
+          # 2. Handle the zipping based on how many artifacts exist
+          if ($artifacts.Count -eq 1) {
+              # SINGLE ARTIFACT: Get the true name from the API, zip the root download folder
+              $artifactName = $artifacts[0].name
+              Write-Host "Single artifact detected via API: $artifactName"
+              
+              Compress-Archive -Path ".\downloaded-artifacts\*" -DestinationPath ".\release-zips\$artifactName.zip" -Force
+          } 
+          else {
+              # MULTIPLE ARTIFACTS: Rely on the subdirectories named by download-artifact
+              Write-Host "Multiple artifacts ($($artifacts.Count)) detected via API."
+              
+              $subDirs = Get-ChildItem -Path .\downloaded-artifacts -Directory
+              foreach ($art in $subDirs) {
+                  $artifactName = $art.Name
+                  Write-Host "Zipping artifact: $artifactName..."
+                  Compress-Archive -Path "$($art.FullName)\*" -DestinationPath ".\release-zips\$artifactName.zip" -Force
+              }
+          }
+
+      - name: Process Tag Name
+        id: process_ref
+        shell: powershell
+        run: |
+          $ref = "${{ inputs.ref }}"
+          
+          # Regex to check if the ref is a 40-character SHA hash
+          if ($ref -match "^[0-9a-fA-F]{40}$") {
+              $shortSha = $ref.Substring(0, 7)
+              $tagName = "v-$shortSha"
+              Write-Host "Ref is a SHA hash. Generating tag: $tagName"
+          } else {
+              # If it's already a branch or tag name, use it as-is
+              $tagName = $ref
+              Write-Host "Ref is a standard branch/tag: $tagName"
+          }
+          
+          # Set outputs for the next step
+          "tag_name=$tagName" | Out-File -FilePath $env:GITHUB_OUTPUT -Append
+
+      - name: Create GitHub Release
+        uses: softprops/action-gh-release@b4309332981a82ec1c5618f44dd2e27cc8bfbfda # v3.0.0
+        with:
+          tag_name: ${{ steps.process_ref.outputs.tag_name }}
+          name: "AOM AVM ${{ steps.process_ref.outputs.tag_name }}"
+          body: |
+            GitHub Actions build of AOMedia AVM version **${{ inputs.ref }}**.
+          files: "release-zips/*.zip"
+          make_latest: true
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
