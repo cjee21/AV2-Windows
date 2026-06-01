@@ -1,0 +1,46 @@
+name: Build AVM
+
+on: push
+
+jobs:
+  build:
+    name: Build (${{ matrix.name }})
+    runs-on: ${{ matrix.runner }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - name: windows-x86_64
+            runner: windows-latest
+          - name: windows-arm64
+            runner: windows-11-arm
+
+    steps:
+      - name: Checkout
+        uses: actions/checkout@v6
+        with:
+          path: AV2-Windows
+
+      - name: Checkout AOMedia AVM
+        uses: actions/checkout@v6
+        with:
+          repository: AOMediaCodec/avm
+          path: avm
+
+      - name: Setup MSVC Environment
+        uses: ./AV2-Windows/.github/actions/setup-msvc
+
+      - name: Configure
+        run: cmake avm -B build -G Ninja -DCMAKE_BUILD_TYPE=Release -DCMAKE_INSTALL_PREFIX=avm-install -DENABLE_TESTS=0 -DENABLE_TOOLS=0
+
+      - name: Build
+        run: cmake --build build
+
+      - name: Install
+        run: cmake --install build
+
+      - name: Upload Artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: avm-${{ matrix.name }}
+          path: avm-install\*
